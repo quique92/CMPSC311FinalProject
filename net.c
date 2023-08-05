@@ -18,14 +18,34 @@ int cli_sd = -1;
 It may need to call the system call "read" multiple times to reach the given size len. 
 */
 static bool nread(int fd, int len, uint8_t *buf) {
-  return false;
+  int bytes_read = 0;
+  int re = 0;
+  //loop in case read is interrupted
+  while(bytes_read < len) {
+    re = read(cli_sd,buf + bytes_read, len - bytes_read);
+    if (re == -1) {
+      return false;
+    }
+    bytes_read += re;
+  }
+  return true;
 }
 
 /* attempts to write n bytes to fd; returns true on success and false on failure 
 It may need to call the system call "write" multiple times to reach the size len.
 */
 static bool nwrite(int fd, int len, uint8_t *buf) {
-  return false;
+  int bytes_written = 0;
+  int wr = 0;
+  //loop in case write is interrupted
+  while(bytes_written < len) {
+    wr = write(cli_sd,buf + bytes_written, len - bytes_written);
+    if( wr == -1) {
+      return false;
+    }
+    bytes_written += wr;
+  }
+  return true;
 }
 
 /* Through this function call the client attempts to receive a packet from sd 
@@ -43,7 +63,36 @@ and then use the length field in the header to determine whether it is needed to
 a block of data from the server. You may use the above nread function here.  
 */
 static bool recv_packet(int sd, uint32_t *op, uint16_t *ret, uint8_t *block) {
+  uint8_t packet[HEADER_LEN];
+  uint16_t len;
+  if(nread(cli_sd,HEADER_LEN,packet) == false) {
+      return false;
+    }
+
+  memcpy(&len, packet,2);
+  memcpy(ret, packet + 6, 2);
+  memcpy(op,packet+2,5);
+  //convert byte orders
+  *op = ntohl(*op);
+  *ret = ntohs(*ret);
+  len = ntohs(len);
+  //success on 0 return, anything else fail
+  if(*ret == 0) {
+    //if pack length is max, 
+    if(len == 264) {
+      //read data block
+      if(nread(cli_sd,256,block)== false) {
+        return false;
+      }
+      return true;
+    }
+    else {
+      return true;
+    }
+
+  }
   return false;
+
 }
 
 
@@ -59,9 +108,34 @@ The above information (when applicable) has to be wrapped into a jbod request pa
 You may call the above nwrite function to do the actual sending.  
 */
 static bool send_packet(int sd, uint32_t op, uint8_t *block) {
-    return false;
+  uint8_t packet[HEADER_LEN +256];
+  uint32_t netop;
+  uint32_t cmd = op<<12;
+  uint16_t temp = HEADER_LEN;
+  uint16_t len = htons(temp);
+  uint16_t rv = 65535;
+  cmd >>= 26;
+  netop = htonl(op);
+  //if it is a write command we need to add the data block to the packet
+  if(cmd == JBOD_WRITE_BLOCK) {
+    temp = HEADER_LEN + 256;
+    len = htons(temp);
+    //format packet
+    memcpy(packet,&len,2);
+    memcpy(packet+2, &netop, 4);
+    memcpy(packet+6,&rv,2);
+    memcpy(packet+8, block, 256);
+    //write the packet to the socket buffer
+    return nwrite(cli_sd, HEADER_LEN+256,packet);
+  }
+  //format packet
+  memcpy(packet,&len,2);
+  memcpy(packet+2,&netop,4);
+  memcpy(packet+6,&rv,2);
+  return nwrite(cli_sd, HEADER_LEN, packet);
 
 }
+
 
 
 
@@ -71,7 +145,21 @@ static bool send_packet(int sd, uint32_t op, uint8_t *block) {
  * you will not call it in mdadm.c
 */
 bool jbod_connect(const char *ip, uint16_t port) {
+  struct sockaddr_in caddr;
+  caddr.sin_family =  AF_INET;
+  caddr.sin_port = htons(port);
+  if(inet_aton(ip, &caddr.sin_addr) == 0) {
+    
     return false;
+  }
+  cli_sd = socket(AF_INET, SOCK_STREAM, 0);
+  if(cli_sd == -1) {
+    return false;
+  }
+  if(connect(cli_sd, (const struct sockaddr*)&caddr, sizeof(caddr)) == -1) {
+    return false;
+  } 
+  return true;
 }
 
 
@@ -79,7 +167,10 @@ bool jbod_connect(const char *ip, uint16_t port) {
 
 /* disconnects from the server and resets cli_sd */
 void jbod_disconnect(void) {
-    return false;
+    close(cli_sd);
+    cli_sd = -1;
+
+
 }
 
 
@@ -91,5 +182,14 @@ The meaning of each parameter is the same as in the original jbod_operation func
 return: 0 means success, -1 means failure.
 */
 int jbod_client_operation(uint32_t op, uint8_t *block) {
+ 
+  
+  if(send_packet(cli_sd, op, block) == false) {
     return -1;
+  }
+  uint16_t rv = 65535;
+  if(recv_packet(cli_sd, &op, &rv, block) ==  false) {
+    return -1;
+  }
+  return 0;
 }
